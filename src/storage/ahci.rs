@@ -1,6 +1,6 @@
-// QBX Centurion - Pilote de stockage SATA / AHCI
+// QBX Centurion - Pilote de stockage SATA / AHCI (Multi-ports dynamique)
 // Fichier : src/storage/ahci.rs
-// Description : Moteur DMA sécurisé avec tampon de rebond aligné, timeout et mode scrutation (sans tempête IRQ)
+// Description : Moteur DMA sécurisé avec balayage automatique des ports et sélection du disque de données
 
 use crate::println;
 use x86_64::instructions::port::Port;
@@ -40,7 +40,6 @@ struct PrdtEntry {
     dbc: u32,
 }
 
-// Tampon DMA statique garanti aligné sur 512 octets (ne traverse jamais une frontière de page 4 Ko)
 #[repr(C, align(512))]
 struct DmaBounceBuffer([u8; 512]);
 
@@ -54,7 +53,8 @@ static mut CMD_TABLE: PortCommandTable = PortCommandTable {
 };
 static mut DMA_BOUNCE_BUF: DmaBounceBuffer = DmaBounceBuffer([0; 512]);
 
-static mut PORT_0_BASE: usize = 0;
+// Port désigné automatiquement pour le stockage persistant (VFS / edt)
+static mut STORAGE_PORT_BASE: usize = 0;
 
 fn pci_lire_u32(bus: u8, slot: u8, fonction: u8, offset: u8) -> u32 {
     let adresse = ((bus as u32) << 16)
@@ -129,18 +129,28 @@ fn configurer_controleur(base_abar: usize) {
 
     unsafe {
         let pi = core::ptr::read_volatile(ptr_pi);
+        println!("[AHCI] Balayage des ports implémentés (PI: 0x{:08X})...", pi);
 
-        if (pi & 1) != 0 {
-            let port_base = base_abar + 0x100;
-            let ssts = core::ptr::read_volatile((port_base + 0x28) as *const u32);
-            let det = ssts & 0x0F;
-            let ipm = (ssts >> 8) & 0x0F;
+        // Balayage dynamique de tous les ports pris en charge par le contrôleur (0 à 31)
+        for i in 0..32 {
+            if (pi & (1 << i)) != 0 {
+                let port_base = base_abar + 0x100 + (i * 0x80);
+                let ssts = core::ptr::read_volatile((port_base + 0x28) as *const u32);
+                let det = ssts & 0x0F;
+                let ipm = (ssts >> 8) & 0x0F;
 
-            if det == 3 && ipm == 1 {
-                println!("[AHCI] Initialisation du moteur DMA sur le Port 0...");
-                if initialiser_port_dma(port_base) {
-                    interroger_disque(port_base);
-                    core::ptr::write_volatile(core::ptr::addr_of_mut!(PORT_0_BASE), port_base);
+                // Si un périphérique est connecté et actif
+                if det == 3 && ipm == 1 {
+                    if initialiser_port_dma(port_base) {
+                        let taille_mo = interroger_disque(port_base, i);
+
+                        // Si le disque fait plus de 10 Mo, c'est notre disque de données (disk.img / 1Go)
+                        // On l'attribue définitivement comme support de stockage principal pour le système
+                        if taille_mo > 10 && STORAGE_PORT_BASE == 0 {
+                            core::ptr::write_volatile(core::ptr::addr_of_mut!(STORAGE_PORT_BASE), port_base);
+                            println!("[AHCI] -> Port {} désigné comme disque de stockage principal (VFS).", i);
+                        }
+                    }
                 }
             }
         }
@@ -207,17 +217,17 @@ unsafe fn initialiser_port_dma(port: usize) -> bool {
     true
 }
 
-unsafe fn interroger_disque(port: usize) {
+unsafe fn interroger_disque(port: usize, port_index: usize) -> u64 {
     let ptr_cmd_table = core::ptr::addr_of!(CMD_TABLE) as u64;
     let ptr_bounce = core::ptr::addr_of!(DMA_BOUNCE_BUF) as u64;
 
     let phys_cmd_table = match crate::memory::traduire_virtuelle_vers_physique(ptr_cmd_table) {
         Some(a) => a,
-        None => return,
+        None => return 0,
     };
     let phys_bounce = match crate::memory::traduire_virtuelle_vers_physique(ptr_bounce) {
         Some(a) => a,
-        None => return,
+        None => return 0,
     };
 
     let header_ptr = core::ptr::addr_of_mut!(CMD_LIST.0) as *mut u32;
@@ -231,7 +241,7 @@ unsafe fn interroger_disque(port: usize) {
         dba: phys_bounce as u32,
         dbau: (phys_bounce >> 32) as u32,
         rsv0: 0,
-        dbc: 512 - 1, // Pas de bit 31 : pas d'interruption
+        dbc: 512 - 1,
     });
 
     let cfis_ptr = core::ptr::addr_of_mut!(CMD_TABLE.cfis) as *mut u8;
@@ -256,7 +266,7 @@ unsafe fn interroger_disque(port: usize) {
         let ci = core::ptr::read_volatile(ptr_ci);
         if (ci & 1) == 0 { break; }
         if (core::ptr::read_volatile((port + 0x10) as *const u32) & (1 << 30)) != 0 || timeout == 0 {
-            return;
+            return 0;
         }
         timeout -= 1;
         core::hint::spin_loop();
@@ -296,18 +306,20 @@ unsafe fn interroger_disque(port: usize) {
 
     let taille_mo = (total_secteurs * 512) / (1024 * 1024);
 
-    println!("       ┌── Disque SATA Port 0 ────────────────────────┐");
-    println!("       │ Modèle    : {:<33}│", model);
-    println!("       │ Série     : {:<33}│", serial);
-    println!("       │ Capacité  : {} Mo ({} secteurs LBA)  │", taille_mo, total_secteurs);
-    println!("       └──────────────────────────────────────────────┘");
+    println!("       ┌── Disque SATA Port {} ──────────────────────────────┐", port_index);
+    println!("       │ Modèle    : {:<37}│", model);
+    println!("       │ Série     : {:<37}│", serial);
+    println!("       │ Capacité  : {} Mo ({} secteurs LBA)         │", taille_mo, total_secteurs);
+    println!("       └─────────────────────────────────────────────────────┘");
+
+    taille_mo
 }
 
 pub fn lire_secteur(lba: u64, tampon: &mut [u8; 512]) -> Result<(), &'static str> {
     unsafe {
-        let port = core::ptr::read_volatile(core::ptr::addr_of!(PORT_0_BASE));
+        let port = core::ptr::read_volatile(core::ptr::addr_of!(STORAGE_PORT_BASE));
         if port == 0 {
-            return Err("Port AHCI 0 non initialisé");
+            return Err("Aucun port de stockage SATA principal initialisé");
         }
         let bounce_ptr = core::ptr::addr_of_mut!(DMA_BOUNCE_BUF.0) as *mut u8;
         executer_transfert_dma(port, lba, bounce_ptr, false)?;
@@ -318,9 +330,9 @@ pub fn lire_secteur(lba: u64, tampon: &mut [u8; 512]) -> Result<(), &'static str
 
 pub fn ecrire_secteur(lba: u64, donnees: &[u8; 512]) -> Result<(), &'static str> {
     unsafe {
-        let port = core::ptr::read_volatile(core::ptr::addr_of!(PORT_0_BASE));
+        let port = core::ptr::read_volatile(core::ptr::addr_of!(STORAGE_PORT_BASE));
         if port == 0 {
-            return Err("Port AHCI 0 non initialisé");
+            return Err("Aucun port de stockage SATA principal initialisé");
         }
         let bounce_ptr = core::ptr::addr_of_mut!(DMA_BOUNCE_BUF.0) as *mut u8;
         core::ptr::copy_nonoverlapping(donnees.as_ptr(), bounce_ptr, 512);
@@ -349,7 +361,7 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
         dba: phys_buf as u32,
         dbau: (phys_buf >> 32) as u32,
         rsv0: 0,
-        dbc: 512 - 1, // DBC sans bit 31 : désactivation de l'interruption matérielle
+        dbc: 512 - 1,
     });
 
     let cfis_ptr = core::ptr::addr_of_mut!(CMD_TABLE.cfis) as *mut u8;
@@ -373,7 +385,6 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
     core::ptr::write_volatile(cfis_ptr.add(12), 1);
     core::ptr::write_volatile(cfis_ptr.add(13), 0);
 
-    // Acquittement des statuts résiduels
     core::ptr::write_volatile((port + 0x10) as *mut u32, 0xFFFF_FFFF);
 
     let ptr_tfd = (port + 0x20) as *const u32;
@@ -388,7 +399,6 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
     let ptr_ci = (port + 0x38) as *mut u32;
     core::ptr::write_volatile(ptr_ci, 1);
 
-    // Boucle d'attente avec timeout d'échappement anti-gel
     timeout = 1_000_000;
     loop {
         let ci = core::ptr::read_volatile(ptr_ci);
@@ -406,7 +416,6 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
         core::hint::spin_loop();
     }
 
-    // Acquittement post-commande
     core::ptr::write_volatile((port + 0x10) as *mut u32, 0xFFFF_FFFF);
     Ok(())
 }

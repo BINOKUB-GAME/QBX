@@ -1,6 +1,6 @@
-// QBX EDT Affichage - Révision 1.0
+// QBX EDT Affichage - Révision 1.1
 // Fichier : src/commandes/edt/affichage.rs
-// Description : Rendu direct en mémoire VGA (0xb8000) avec indicateur L/C et flash de sauvegarde
+// Description : Rendu direct en mémoire VGA (0xb8000) avec indicateur L/C, flash de sauvegarde et ligne de commande interactive
 
 use crate::commandes::edt::moteur::Editeur;
 
@@ -29,27 +29,45 @@ pub fn effacer_ecran_complet() {
 }
 
 // --- [FONCTION 3 : dessiner_barre_statut] ---
-// Description : Trace la ligne de statut avec position L/C, nom du fichier ou message de sauvegarde.
-pub fn dessiner_barre_statut(nom_fichier: &str, ligne: usize, col: usize, sauvegarde_flash: bool) {
+// Description : Trace la ligne de statut ou la ligne de commande interactive selon le mode de l'éditeur.
+pub fn dessiner_barre_statut(editeur: &Editeur, nom_fichier: &str, ligne: usize, col: usize) {
     for x in 0..LARGEUR {
         ecrire_vga(x, 24, b'-', 0x07);
     }
 
     let mut pos = 0;
-    let entete = if sauvegarde_flash {
-        alloc::string::String::from(" [ Sauvegarde avec succes ! ] ")
-    } else {
-        alloc::format!(" L:{} C:{} | Fichier: ", ligne + 1, col + 1)
-    };
 
-    for b in entete.bytes() {
-        if pos < LARGEUR {
-            ecrire_vga(pos, 24, b, if sauvegarde_flash { 0x0a } else { 0x0f });
-            pos += 1;
+    if editeur.en_mode_commande {
+        // Mode Commande actif (style vi sur la ligne du bas)
+        let prompt = ":";
+        for b in prompt.bytes() {
+            if pos < LARGEUR {
+                ecrire_vga(pos, 24, b, 0x0e); // Jaune vif pour le prompt
+                pos += 1;
+            }
         }
-    }
-
-    if !sauvegarde_flash {
+        for &b in &editeur.tampon_commande {
+            if pos < LARGEUR {
+                ecrire_vga(pos, 24, b, 0x0f); // Blanc éclatant pour la saisie
+                pos += 1;
+            }
+        }
+    } else if editeur.sauvegarde_flash {
+        let entete = " [ Sauvegarde avec succes ! ] ";
+        for b in entete.bytes() {
+            if pos < LARGEUR {
+                ecrire_vga(pos, 24, b, 0x0a);
+                pos += 1;
+            }
+        }
+    } else {
+        let entete = alloc::format!(" L:{} C:{} | Fichier: ", ligne + 1, col + 1);
+        for b in entete.bytes() {
+            if pos < LARGEUR {
+                ecrire_vga(pos, 24, b, 0x0f);
+                pos += 1;
+            }
+        }
         for b in nom_fichier.bytes() {
             if pos < LARGEUR {
                 ecrire_vga(pos, 24, b, 0x0e);
@@ -82,7 +100,6 @@ pub fn dessiner_interface(editeur: &Editeur) {
         "[Sans nom]"
     };
 
-    // Calculer la ligne et la colonne actuelles en fonction de la position du curseur
     let mut ligne = 0;
     let mut col = 0;
     for i in 0..editeur.curseur_pos.min(editeur.tampon.len()) {
@@ -94,9 +111,8 @@ pub fn dessiner_interface(editeur: &Editeur) {
         }
     }
     
-    dessiner_barre_statut(nom, ligne, col, editeur.sauvegarde_flash);
+    dessiner_barre_statut(editeur, nom, ligne, col);
 
-    // 1. Trouver l'index du tampon où commence la première ligne visible (ligne_debut)
     let mut byte_debut_affichage = 0;
     let mut lignes_compteur = 0;
     
@@ -117,7 +133,6 @@ pub fn dessiner_interface(editeur: &Editeur) {
     let mut screen_y = 0;
     let mut abs_line_num = editeur.ligne_debut;
 
-    // Affichage du premier numéro de ligne si l'option -l est active
     if editeur.option_l && screen_y < HAUTEUR_EDIT {
         let num_str = if abs_line_num + 1 < 10 {
             alloc::format!("{}  ", abs_line_num + 1)
@@ -139,9 +154,8 @@ pub fn dessiner_interface(editeur: &Editeur) {
     };
     let en_selection = editeur.selection_debut.is_some();
 
-    // 2. Parcourir le tampon à partir du début de la zone visible
     for (i, &byte) in editeur.tampon.iter().enumerate().skip(byte_debut_affichage) {
-        let est_curseur = i == editeur.curseur_pos;
+        let est_curseur = i == editeur.curseur_pos && !editeur.en_mode_commande;
         let dans_bloc = en_selection && i >= sel_min && i < sel_max;
         
         let couleur = if est_curseur {
@@ -191,8 +205,7 @@ pub fn dessiner_interface(editeur: &Editeur) {
         }
     }
 
-    // Si le curseur est placé à la toute fin du fichier
-    if editeur.curseur_pos >= editeur.tampon.len() && screen_y < HAUTEUR_EDIT {
+    if editeur.curseur_pos >= editeur.tampon.len() && screen_y < HAUTEUR_EDIT && !editeur.en_mode_commande {
         ecrire_vga(screen_x, screen_y, b'_', 0x0f);
     }
 }

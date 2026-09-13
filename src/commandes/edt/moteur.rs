@@ -1,6 +1,6 @@
-// QBX EDT Engine - Révision 1.9
+// QBX EDT Engine - Révision 2.0
 // Fichier : src/commandes/edt/moteur.rs
-// Description : Moteur avec buffer anonyme, indicateur L/C, flash de sauvegarde et gestion complète
+// Description : Moteur avec gestion de la machine à états pour le mode commande interactif (style vi)
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -21,6 +21,8 @@ pub struct Editeur {
     pub presse_papier: Vec<u8>,
     pub selection_debut: Option<usize>,
     pub sauvegarde_flash: bool,
+    pub en_mode_commande: bool,
+    pub tampon_commande: Vec<u8>,
 }
 
 impl Editeur {
@@ -37,6 +39,8 @@ impl Editeur {
             presse_papier: Vec::new(),
             selection_debut: None,
             sauvegarde_flash: false,
+            en_mode_commande: false,
+            tampon_commande: Vec::new(),
         }
     }
 
@@ -51,6 +55,8 @@ impl Editeur {
         self.actif = true;
         self.selection_debut = None;
         self.sauvegarde_flash = false;
+        self.en_mode_commande = false;
+        self.tampon_commande.clear();
 
         let nom_trim = nom_fichier.trim();
         if nom_trim.is_empty() {
@@ -82,10 +88,6 @@ impl Editeur {
         self.actif = false;
         vga_buffer::clear_screen();
         crate::print!("qbx> ");
-    }
-
-    pub fn sauvegarder(&mut self) {
-        self.enregistrer();
     }
 
     pub fn enregistrer(&mut self) {
@@ -293,14 +295,76 @@ impl Editeur {
         }
     }
 
+    // Exécution d'une commande saisie dans la ligne du bas (ex: w, q)
+    fn executer_commande(&mut self) {
+        let cmd_propre = if let Ok(cmd) = core::str::from_utf8(&self.tampon_commande) {
+            alloc::string::ToString::to_string(cmd.trim())
+        } else {
+            alloc::string::String::new()
+        };
+
+        if cmd_propre == "w" || cmd_propre == "wq" {
+            self.enregistrer();
+        }
+        if cmd_propre == "q" || cmd_propre == "wq" {
+            self.quitter();
+            return;
+        }
+
+        self.en_mode_commande = false;
+        self.tampon_commande.clear();
+        affichage::dessiner_interface(self);
+    }
+
     pub fn traiter_touche(&mut self, key: DecodedKey) -> bool {
-        // Efface le flash de sauvegarde dès qu'une action/frappe survient
         self.sauvegarde_flash = false;
 
+        // Gestion séparée selon que l'on est en Mode Commande ou en Mode Édition normale
+        if self.en_mode_commande {
+            match key {
+                DecodedKey::RawKey(KeyCode::Escape) | DecodedKey::Unicode('\x1b') => {
+                    // Annuler le mode commande et revenir à l'édition
+                    self.en_mode_commande = false;
+                    self.tampon_commande.clear();
+                    affichage::dessiner_interface(self);
+                }
+                DecodedKey::Unicode('\n') => {
+                    // Valider la commande avec Entrée
+                    self.executer_commande();
+                }
+                DecodedKey::Unicode('\x08') => {
+                    // Backspace : si le tampon est vide, on annule et repasse en mode édition
+                    if self.tampon_commande.is_empty() {
+                        self.en_mode_commande = false;
+                        affichage::dessiner_interface(self);
+                    } else {
+                        self.tampon_commande.pop();
+                        affichage::dessiner_interface(self);
+                    }
+                }
+                DecodedKey::Unicode(c) => {
+                    if c >= ' ' && c <= '~' {
+                        self.tampon_commande.push(c as u8);
+                        affichage::dessiner_interface(self);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Mode Édition Normale
         match key {
             DecodedKey::RawKey(KeyCode::Escape) | DecodedKey::Unicode('\x1b') => {
                 self.quitter();
                 return true;
+            }
+            DecodedKey::Unicode(':') => {
+                // Entrée dans le mode commande (style vi)
+                self.en_mode_commande = true;
+                self.tampon_commande.clear();
+                affichage::dessiner_interface(self);
+                return false;
             }
             DecodedKey::RawKey(KeyCode::F2) => {
                 self.enregistrer();

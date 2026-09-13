@@ -11,6 +11,9 @@ DESCRIPTION
      Il permet de créer, afficher et modifier des fichiers texte en mode
      plein écran (80x23) avec persistance directe sur le disque SATA (/var).
 
+     Il intègre également un mode commande interactif accessible
+     en tapant `:` depuis le mode d'édition normal sur la ligne inférieure de l'écran.
+
      Si aucun fichier n'est spécifié au démarrage, l'éditeur s'ouvre sur
      un espace de travail vierge et anonyme ([Sans nom]). Les modifications
      sont enregistrées sur le stockage persistant à la demande de l'utilisateur.
@@ -19,12 +22,21 @@ OPTIONS
      -l        Affiche les numéros de ligne dynamiques le long de la marge.
      fichier   Nom du fichier à charger ou créer depuis le système VFS.
 
+MODE COMMANDE
+     Appuyer sur la touche `:` active la ligne de commande interactive en bas de l'écran.
+     Les commandes internes suivantes sont actuellement prises en charge :
+     :w        Enregistre les modifications du fichier en cours.
+     :q        Quitte l'éditeur.
+     :wq       Enregistre les modifications et quitte l'éditeur.
+     [ESC]     Annule la commande en cours et retourne au mode d'édition texte.
+     [Bksp]    Efface le caractère ou annule le mode commande si la ligne est vide.
+
 TOUCHES DE CONTRÔLE
      [F2]      Sauvegarde le tampon sur le disque dur (/var).
      [F3]      Copie la ligne ou le bloc sélectionné dans le presse-papier.
      [F4]      Coupe la ligne ou le bloc sélectionné vers le presse-papier.
      [F5]      Colle le contenu du presse-papier à la position du curseur.
      [F6]      Pose ou efface un point d'ancrage pour délimiter un bloc.
-     [ESC]     Quitte l'éditeur et revient au shell.
+     [ESC]     Quitte l'éditeur et revient au shell (en mode édition).
 
-QBX v0.1.0                      Révision 0.2                      EDT(1)
+QBX v0.1.0                      Révision 0.3                      EDT(1)
