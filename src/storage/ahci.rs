@@ -1,6 +1,10 @@
-// QBX Centurion - Pilote de stockage SATA / AHCI
-// Fichier : src/storage/ahci.rs
-// Description : Moteur DMA sécurisé avec tampon de rebond aligné, timeout et mode scrutation (sans tempête IRQ)
+// =========================================================================
+// Nom du script       : src/storage/ahci.rs
+// Numéro de révision  : Révision 1.4
+// Description         : Pilote de stockage SATA / AHCI avec mappage MMIO 
+//                       explicite de l'ABAR (0xFEBF0000) pour éliminer les 
+//                       défauts de page (#PF) sur les registres matériels.
+// =========================================================================
 
 use crate::println;
 use x86_64::instructions::port::Port;
@@ -40,7 +44,6 @@ struct PrdtEntry {
     dbc: u32,
 }
 
-// Tampon DMA statique garanti aligné sur 512 octets (ne traverse jamais une frontière de page 4 Ko)
 #[repr(C, align(512))]
 struct DmaBounceBuffer([u8; 512]);
 
@@ -56,6 +59,7 @@ static mut DMA_BOUNCE_BUF: DmaBounceBuffer = DmaBounceBuffer([0; 512]);
 
 static mut PORT_0_BASE: usize = 0;
 
+// --- [FONCTION 1] Lecture de configuration PCI 32 bits ---
 fn pci_lire_u32(bus: u8, slot: u8, fonction: u8, offset: u8) -> u32 {
     let adresse = ((bus as u32) << 16)
         | ((slot as u32) << 11)
@@ -71,6 +75,7 @@ fn pci_lire_u32(bus: u8, slot: u8, fonction: u8, offset: u8) -> u32 {
     }
 }
 
+// --- [FONCTION 2] Écriture de configuration PCI 32 bits ---
 fn pci_ecrire_u32(bus: u8, slot: u8, fonction: u8, offset: u8, valeur: u32) {
     let adresse = ((bus as u32) << 16)
         | ((slot as u32) << 11)
@@ -86,6 +91,7 @@ fn pci_ecrire_u32(bus: u8, slot: u8, fonction: u8, offset: u8, valeur: u32) {
     }
 }
 
+// --- [FONCTION 3] Initialisation et détection du contrôleur AHCI avec mappage MMIO ---
 pub fn initialiser() {
     println!("[AHCI] Analyse du bus PCI à la recherche du contrôleur SATA...");
 
@@ -112,8 +118,20 @@ pub fn initialiser() {
                 cmd |= (1 << 1) | (1 << 2);
                 pci_ecrire_u32(bus, slot, 0, 0x04, cmd);
 
-                let abar_phys = pci_lire_u32(bus, slot, 0, 0x24) & 0xFFFF_FFF0;
-                let abar_virt = crate::memory::physique_vers_virtuelle(abar_phys as u64) as usize;
+                // Attribution de l'adresse physique MMIO haute
+                let abar_phys = 0xFEBF0000u32;
+                pci_ecrire_u32(bus, slot, 0, 0x24, abar_phys);
+
+                // Mappage explicite de la zone MMIO dans les tables de pages pour éviter le Page Fault
+                let abar_virt = match crate::memory::mapper_mmio(abar_phys as u64, 0x1000) {
+                    Some(vaddr) => vaddr as usize,
+                    None => {
+                        println!("[AHCI] ERREUR : Impossible de mapper la zone MMIO ABAR.");
+                        return;
+                    }
+                };
+
+                println!("[AHCI] ABAR Mappé - Phys: 0x{:08X} -> Virt: 0x{:016X}", abar_phys, abar_virt);
 
                 configurer_controleur(abar_virt);
                 return;
@@ -124,6 +142,7 @@ pub fn initialiser() {
     println!("[AHCI] Aucun contrôleur AHCI SATA détecté sur le bus.");
 }
 
+// --- [FONCTION 4] Configuration générale du contrôleur AHCI ---
 fn configurer_controleur(base_abar: usize) {
     let ptr_pi = (base_abar + 0x0C) as *const u32;
 
@@ -147,6 +166,7 @@ fn configurer_controleur(base_abar: usize) {
     }
 }
 
+// --- [FONCTION 5] Arrêt sécurisé du port DMA ---
 unsafe fn arreter_port_dma(port: usize) {
     let ptr_cmd = (port + 0x18) as *mut u32;
 
@@ -165,6 +185,7 @@ unsafe fn arreter_port_dma(port: usize) {
     }
 }
 
+// --- [FONCTION 6] Démarrage du port DMA ---
 unsafe fn demarrer_port_dma(port: usize) {
     let ptr_cmd = (port + 0x18) as *mut u32;
 
@@ -179,6 +200,7 @@ unsafe fn demarrer_port_dma(port: usize) {
     core::ptr::write_volatile(ptr_cmd, cmd);
 }
 
+// --- [FONCTION 7] Initialisation des registres DMA du port ---
 unsafe fn initialiser_port_dma(port: usize) -> bool {
     arreter_port_dma(port);
 
@@ -207,6 +229,7 @@ unsafe fn initialiser_port_dma(port: usize) -> bool {
     true
 }
 
+// --- [FONCTION 8] Interrogation ATA (Identify) du disque connecté ---
 unsafe fn interroger_disque(port: usize) {
     let ptr_cmd_table = core::ptr::addr_of!(CMD_TABLE) as u64;
     let ptr_bounce = core::ptr::addr_of!(DMA_BOUNCE_BUF) as u64;
@@ -231,7 +254,7 @@ unsafe fn interroger_disque(port: usize) {
         dba: phys_bounce as u32,
         dbau: (phys_bounce >> 32) as u32,
         rsv0: 0,
-        dbc: 512 - 1, // Pas de bit 31 : pas d'interruption
+        dbc: 512 - 1,
     });
 
     let cfis_ptr = core::ptr::addr_of_mut!(CMD_TABLE.cfis) as *mut u8;
@@ -303,11 +326,12 @@ unsafe fn interroger_disque(port: usize) {
     println!("       └──────────────────────────────────────────────┘");
 }
 
+// --- [FONCTION 9] Lecture d'un secteur disque ---
 pub fn lire_secteur(lba: u64, tampon: &mut [u8; 512]) -> Result<(), &'static str> {
     unsafe {
         let port = core::ptr::read_volatile(core::ptr::addr_of!(PORT_0_BASE));
         if port == 0 {
-            return Err("Port AHCI 0 non initialisé");
+            return Err("Port AHCI 0 non initialisé (aucun disque SATA actif)");
         }
         let bounce_ptr = core::ptr::addr_of_mut!(DMA_BOUNCE_BUF.0) as *mut u8;
         executer_transfert_dma(port, lba, bounce_ptr, false)?;
@@ -316,11 +340,12 @@ pub fn lire_secteur(lba: u64, tampon: &mut [u8; 512]) -> Result<(), &'static str
     }
 }
 
+// --- [FONCTION 10] Écriture d'un secteur disque ---
 pub fn ecrire_secteur(lba: u64, donnees: &[u8; 512]) -> Result<(), &'static str> {
     unsafe {
         let port = core::ptr::read_volatile(core::ptr::addr_of!(PORT_0_BASE));
         if port == 0 {
-            return Err("Port AHCI 0 non initialisé");
+            return Err("Port AHCI 0 non initialisé (aucun disque SATA actif)");
         }
         let bounce_ptr = core::ptr::addr_of_mut!(DMA_BOUNCE_BUF.0) as *mut u8;
         core::ptr::copy_nonoverlapping(donnees.as_ptr(), bounce_ptr, 512);
@@ -328,6 +353,7 @@ pub fn ecrire_secteur(lba: u64, donnees: &[u8; 512]) -> Result<(), &'static str>
     }
 }
 
+// --- [FONCTION 11] Exécution bas niveau des transferts DMA ---
 unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_ecriture: bool) -> Result<(), &'static str> {
     let phys_cmd_table = crate::memory::traduire_virtuelle_vers_physique(core::ptr::addr_of!(CMD_TABLE) as u64)
         .ok_or("Échec résolution physique Command Table")?;
@@ -349,7 +375,7 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
         dba: phys_buf as u32,
         dbau: (phys_buf >> 32) as u32,
         rsv0: 0,
-        dbc: 512 - 1, // DBC sans bit 31 : désactivation de l'interruption matérielle
+        dbc: 512 - 1,
     });
 
     let cfis_ptr = core::ptr::addr_of_mut!(CMD_TABLE.cfis) as *mut u8;
@@ -373,11 +399,10 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
     core::ptr::write_volatile(cfis_ptr.add(12), 1);
     core::ptr::write_volatile(cfis_ptr.add(13), 0);
 
-    // Acquittement des statuts résiduels
     core::ptr::write_volatile((port + 0x10) as *mut u32, 0xFFFF_FFFF);
 
     let ptr_tfd = (port + 0x20) as *const u32;
-    let mut timeout = 100_000;
+    let mut timeout =  100_000;
     while (core::ptr::read_volatile(ptr_tfd) & (0x80 | 0x08)) != 0 && timeout > 0 {
         timeout -= 1;
     }
@@ -388,14 +413,13 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
     let ptr_ci = (port + 0x38) as *mut u32;
     core::ptr::write_volatile(ptr_ci, 1);
 
-    // Boucle d'attente avec timeout d'échappement anti-gel
     timeout = 1_000_000;
     loop {
         let ci = core::ptr::read_volatile(ptr_ci);
         if (ci & 1) == 0 {
             break;
         }
-        let is = core::ptr::read_volatile((port + 0x10) as *const u32);
+        let is = core::ptr::read_volatile((port + 0x10) as *mut u32);
         if (is & (1 << 30)) != 0 {
             return Err("Erreur matérielle retournée par le disque lors du transfert");
         }
@@ -406,7 +430,6 @@ unsafe fn executer_transfert_dma(port: usize, lba: u64, buf_virt: *mut u8, est_e
         core::hint::spin_loop();
     }
 
-    // Acquittement post-commande
     core::ptr::write_volatile((port + 0x10) as *mut u32, 0xFFFF_FFFF);
     Ok(())
 }

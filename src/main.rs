@@ -1,6 +1,10 @@
-// QBX Core - Révision 1.3
-// Fichier : src/main.rs
-// Description : Point d'entrée du noyau, initialisation ordonnée et démarrage préemptif sécurisé
+// =========================================================================
+// Nom du script       : src/main.rs
+// Numéro de révision  : Révision 1.17
+// Description         : Point d'entrée du noyau avec scrutation polling active,
+//                       décodeur ScancodeSet1 et suppression du verrouillage 
+//                       Caps Lock forcé pour permettre la saisie en minuscules.
+// =========================================================================
 
 #![no_std]
 #![no_main]
@@ -27,91 +31,115 @@ pub mod storage;
 pub mod scripting;
 pub mod syscalls;
 
-use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use x86_64::VirtAddr;
-use memory::BootInfoFrameAllocator;
+use memory::LimineFrameAllocator;
 use pc_keyboard::{Keyboard, ScancodeSet1, layouts, HandleControl};
 use spin::Mutex;
 use lazy_static::lazy_static;
+use limine::{BaseRevision, RequestsStartMarker, RequestsEndMarker};
+use limine::request::{HhdmRequest, MemmapRequest, FramebufferRequest};
 
-entry_point!(kernel_main);
+// --- [REQUÊTES ET MARQUEURS PROTOCOLE LIMINE] ---
+#[used]
+#[link_section = ".requests_start_marker"]
+static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
 
-#[panic_handler]
-fn gestionnaire_panic(information: &PanicInfo) -> ! {
-    println!("{}", information);
-    loop {
-        x86_64::instructions::hlt();
+#[used]
+#[link_section = ".requests"]
+static BASE_REVISION: BaseRevision = BaseRevision::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+#[used]
+#[link_section = ".requests_end_marker"]
+static REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
+
+// --- [POINT D'ENTRÉE DU NOYAU] ---
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    // 1. Initialisation immédiate du Framebuffer et affichage d'une barre ROUGE en haut
+    if let Some(fb_response) = FRAMEBUFFER_REQUEST.response() {
+        if let Some(fb) = fb_response.framebuffers().first() {
+            let ptr = fb.address() as *mut u32;
+            let pitch = fb.pitch as usize / 4;
+            unsafe {
+                for y in 0..40 {
+                    for x in 0..fb.width as usize {
+                        *ptr.add(y * pitch + x) = 0x00_FF_00_00;
+                    }
+                }
+            }
+            vga_buffer::init_framebuffer(
+                ptr,
+                fb.width as usize,
+                fb.height as usize,
+                fb.pitch as usize,
+            );
+        }
     }
-}
 
-lazy_static! {
-    static ref KEYBOARD_DECODER: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
-        Mutex::new(Keyboard::new(
-            ScancodeSet1::new(),
-            layouts::Us104Key,
-            HandleControl::Ignore,
-        ));
-}
+    assert!(BASE_REVISION.is_supported(), "Erreur : Version de protocole Limine non supportée !");
 
-fn synchroniser_caps_lock() {
-    let mut kb = KEYBOARD_DECODER.lock();
-    if let Ok(Some(event)) = kb.add_byte(0x3A) {
-        kb.process_keyevent(event);
-    }
-    if let Ok(Some(event)) = kb.add_byte(0xBA) {
-        kb.process_keyevent(event);
-    }
-}
+    let hhdm_response = HHDM_REQUEST.response().expect("Erreur : HHDM request non fournie par Limine");
+    let mem_map_response = MEMMAP_REQUEST.response().expect("Erreur : Memmap request non fournie par Limine");
 
-fn kernel_main(boot_info: &'static BootInfo) -> ! {
     println!("  ____  ____  __  __");
     println!(" / __ \\|  _ \\ \\ \\/ /");
     println!("| |  | | |_) ) >  < ");
     println!("| |__| |  _ < / /\\ \\");
     println!(" \\___\\_\\____//_/  \\_\\");
     println!("=== QBX - EXP (Québec UNIX) v0.1 ===");
-    println!("Initialisation du système...\n");
+    println!("Initialisation du système (UEFI / Limine / Framebuffer)...\n");
 
-    // 1. Initialisation IDT et contrôleur PIC (interruptions matérielles laissées masquées)
-    interrupts::init_idt();
-    unsafe { interrupts::PICS.lock().initialize() };
+    // 2. Initialisation globale IDT, PIC et démasquage des IRQs matérielles
+    interrupts::init();
 
-    // 2. Initialisation pagination physique et virtuelle
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
-    memory::enregistrer_offset_physique(boot_info.physical_memory_offset);
+    // 3. Initialisation pagination physique et virtuelle (HHDM)
+    let phys_mem_offset = VirtAddr::new(hhdm_response.offset);
+    memory::enregistrer_offset_physique(hhdm_response.offset);
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
+    
+    let memory_map = mem_map_response.entries();
+    let mut frame_allocator = unsafe { LimineFrameAllocator::init(memory_map) };
 
-    // 3. Montage du tas initial de 2 Mio
+    // 4. Montage du tas initial de 2 Mio
     if let Err(e) = allocator::init_heap(&mut mapper, &mut frame_allocator) {
         panic!("Échec de l'initialisation du Heap : {:?}", e);
     }
 
-    // 4. Contexte mémoire global
+    // 5. Contexte mémoire global
     memory::init_contexte(mapper, frame_allocator);
     println!("Heap 2 MiB : OK");
 
-     
-
-    // 5. Initialisation du sous-système multitâche (Tâche 0 noyau)
+    // 6. Initialisation du sous-système multitâche
     task::initialiser();
 
-// 6.0 Détection matérielle PCI et repérage de l'interface réseau
+    // 7.0 Détection matérielle PCI et réseau
     pci::initialiser();
 
-// 6.1 Initialisation du contrôleur de stockage (AHCI / SATA)
+    // 7.1 Stockage et session
     storage::initialiser();
     session::charger_depuis_disque();
     journal::charger_depuis_disque();
     fs::charger_depuis_disque();
 
-// 7. Initialisation du contrôleur réseau
+    // 8. Réseau
     net::initialiser();
 
-    // 6.1 Journalisation des étapes d'initialisation
-    crate::klog!("[KRN] QBX Microkernel v0.1 démarre");
-    crate::klog!("[CPU] Initialisation IDT et PIC terminée");
+    // Journalisation des étapes
+    crate::klog!("[KRN] QBX Microkernel v0.1 démarre (UEFI/Limine/Framebuffer)");
+    crate::klog!("[CPU] Initialisation IDT, PIC et démasquage IRQ terminés");
     crate::klog!("[MEM] Pagination physique et virtuelle initialisée");
     crate::klog!("[ALC] Heap de 2 MiB initialisé avec succès");
     crate::klog!("[VFS] Système de fichiers en mémoire monté sur '/'");
@@ -120,13 +148,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     println!("Système prêt.\n");
     print!("qbx:{}{} ", fs::chemin_actuel(), session::symbole_prompt());
 
-    synchroniser_caps_lock();
-
-    // 7. Activation des interruptions une fois l'ensemble des sous-systèmes prêt
+    // Activation des interruptions matérielles
     x86_64::instructions::interrupts::enable();
 
-    // --- [BOUCLE DE GESTION DU SHELL] ---
+    // --- [BOUCLE DE GESTION DU SHELL - POLLING ACTIF] ---
     loop {
+        // Scrutation active permanente du port clavier PS/2
+        interrupts::scruter_clavier_ps2();
+
         let scancode_opt = x86_64::instructions::interrupts::without_interrupts(|| {
             clavier_queue::SCANCODE_QUEUE.lock().pop()
         });
@@ -154,8 +183,24 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 }
             }
         } else {
-            task::ceder();
-            x86_64::instructions::hlt();
+            core::hint::spin_loop();
         }
     }
+}
+
+#[panic_handler]
+fn gestionnaire_panic(information: &PanicInfo) -> ! {
+    println!("{}", information);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+lazy_static! {
+    static ref KEYBOARD_DECODER: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
+        Mutex::new(Keyboard::new(
+            ScancodeSet1::new(),
+            layouts::Us104Key,
+            HandleControl::Ignore,
+        ));
 }

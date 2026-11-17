@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bootloader = { version = "0.9.23", features = ["map_physical_memory"] }
+# Protocole de démarrage Limine pour le support UEFI moderne
+limine = "0.6.5"
+
+# Utilitaires et pilotes bas niveau pour le noyau #![no_std]
 volatile = "0.2.6"
-spin = "0.5.2"
+spin = "0.9.8"
 pic8259 = "0.10.1"
 pc-keyboard = "0.7.0"
 linked_list_allocator = "0.10.5"

@@ -1,6 +1,6 @@
-// QBX FileSystem Module - Révision 0.7
+// QBX FileSystem Module - Révision 0.8 (Sécurisé)
 // Fichier : src/fs/mod.rs
-// Description : Façade centrale du VFS persistée sur la partition /var (offset 65+)
+// Description : Façade centrale du VFS persistée sur la partition /var avec protection anti-crash stockage
 
 pub mod node;
 pub mod path;
@@ -57,7 +57,7 @@ impl FileSystem {
         resultat
     }
 
-/// Décompose un chemin (ex: "dossier/fichier.txt" ou "/var/log.txt") en (dossier_parent, nom_fichier)
+    /// Décompose un chemin (ex: "dossier/fichier.txt" ou "/var/log.txt") en (dossier_parent, nom_fichier)
     fn decomposer_chemin(&self, chemin: &str) -> Option<(Vec<String>, String)> {
         let chemin = chemin.trim();
         if chemin.is_empty() {
@@ -92,8 +92,7 @@ impl FileSystem {
         Some((pile, nom_fichier))
     }
 
-
-   pub fn ecrire(&mut self, chemin: &str, donnees: Vec<u8>) -> bool {
+    pub fn ecrire(&mut self, chemin: &str, donnees: Vec<u8>) -> bool {
         let (dossier_parent, nom_fichier) = match self.decomposer_chemin(chemin) {
             Some(res) => res,
             None => return false,
@@ -108,7 +107,7 @@ impl FileSystem {
         false
     }
 
- pub fn lire(&self, chemin: &str) -> Option<Vec<u8>> {
+    pub fn lire(&self, chemin: &str) -> Option<Vec<u8>> {
         let (dossier_parent, nom_fichier) = self.decomposer_chemin(chemin)?;
 
         if let Some(Node::Directory { children, .. }) = self.acceder_noeud(&dossier_parent) {
@@ -133,7 +132,7 @@ impl FileSystem {
         resultats
     }
 
-pub fn lister_cible(&self, chemin: &str) -> Result<Vec<(String, usize, bool, Horodatage)>, &'static str> {
+    pub fn lister_cible(&self, chemin: &str) -> Result<Vec<(String, usize, bool, Horodatage)>, &'static str> {
         let chemin = chemin.trim();
         if chemin.is_empty() || chemin == "." {
             return Ok(self.lister_courant());
@@ -171,7 +170,6 @@ pub fn lister_cible(&self, chemin: &str) -> Result<Vec<(String, usize, bool, Hor
             None => Err("introuvable"),
         }
     }
-
 
     pub fn creer_repertoire(&mut self, nom: &str) -> bool {
         if nom.is_empty() {
@@ -507,8 +505,14 @@ pub fn lister_cible(&self, chemin: &str) -> Result<Vec<(String, usize, bool, Hor
 
     pub fn charger_depuis_disque(&mut self) {
         let mut sb = [0u8; 512];
-        if partitions::lire_secteur_var(LBA_FS_SUPERBLOC, &mut sb).is_err() {
-            return;
+        
+        // Protection sécurisée : si le stockage/disque n'est pas initialisé, on retourne sans planter
+        match partitions::lire_secteur_var(LBA_FS_SUPERBLOC, &mut sb) {
+            Ok(()) => {}
+            Err(_) => {
+                crate::println!("[VAR] Stockage non initialisé ou absent, VFS démarré en mémoire vide.");
+                return;
+            }
         }
 
         if &sb[0..12] != FS_MAGIC {
@@ -634,5 +638,3 @@ pub fn charger_depuis_disque() {
 pub fn synchroniser() {
     SYSTEME_FICHIERS.lock().synchroniser_sur_disque();
 }
-
-

@@ -1,6 +1,13 @@
-// QBX EDT Engine - Révision 1.9
+// QBX EDT Engine - Révision 2.1
 // Fichier : src/commandes/edt/moteur.rs
 // Description : Moteur avec buffer anonyme, indicateur L/C, flash de sauvegarde et gestion complète
+// Intégrations :
+//   1. Editeur::new & est_actif - Initialisation et vérification d'état.
+//   2. Editeur::lancer & quitter - Gestion du cycle de vie de l'éditeur plein écran.
+//   3. Editeur::enregistrer & sauvegarder - Sauvegarde sur disque avec attribut allow(dead_code).
+//   4. Manipulation du texte - Insertion, suppression et déplacement du curseur.
+//   5. Gestion du presse-papier et sélections - Copier, couper, coller et basculement.
+//   6. Gestion des événements clavier - Traitement des touches de fonction et caractères.
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -84,6 +91,7 @@ impl Editeur {
         crate::print!("qbx> ");
     }
 
+    #[allow(dead_code)]
     pub fn sauvegarder(&mut self) {
         self.enregistrer();
     }

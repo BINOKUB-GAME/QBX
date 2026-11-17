@@ -1,6 +1,10 @@
 // QBX Scripting Engine - Interpréteur de scripts corrigé
 // Fichier : src/scripting/mod.rs
+// Révision : 1.1
 // Description : Exécute les lignes de script sans provoquer de deadlock sur le Mutex du shell
+// Intégrations :
+//   1. executer - Analyse et lecture du fichier de script ligne par ligne.
+//   2. executer_ligne_script - Routage sécurisé des commandes avec variables préfixées (_argument, _args).
 
 use crate::fs;
 use crate::println;
@@ -55,8 +59,8 @@ fn executer_ligne_script(entree: &str) {
     }
 
     let commande = parties[0];
-    let argument = parties.get(1).copied().unwrap_or("");
-    let args = &parties[1..];
+    let _argument = parties.get(1).copied().unwrap_or("");
+    let _args = &parties[1..];
 
     match commande {
         "echo" => {

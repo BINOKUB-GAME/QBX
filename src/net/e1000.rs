@@ -1,6 +1,9 @@
-// QBX Centurion - Network Driver (Intel 82540EM / e1000)
-// Fichier : src/net/e1000.rs
-// Description : Descripteurs alignés sur 16 octets, accès DMA volatile et compteurs matériels
+// =========================================================================
+// Nom du script       : src/net/e1000.rs
+// Numéro de révision  : Révision 0.2
+// Description         : Pilote réseau Intel e1000 avec mappage MMIO explicite 
+//                       via memory::mapper_mmio pour éliminer le Défaut de Page (#PF).
+// =========================================================================
 
 use spin::Mutex;
 use alloc::boxed::Box;
@@ -31,10 +34,9 @@ const REG_TDT: u32    = 0x3818;
 // Adresses MAC et compteurs statistiques matériels
 const REG_RAL: u32    = 0x5400;
 const REG_RAH: u32    = 0x5404;
-const REG_GPRC: u32   = 0x4074; // Good Packets Received Count
-const REG_GPTC: u32   = 0x4080; // Good Packets Transmitted Count
+const REG_GPRC: u32   = 0x4074;
+const REG_GPTC: u32   = 0x4080;
 
-// Configuration RCTL
 const RCTL_EN: u32     = 1 << 1;
 const RCTL_SBP: u32    = 1 << 2;
 const RCTL_UPE: u32    = 1 << 3;
@@ -43,7 +45,6 @@ const RCTL_BAM: u32    = 1 << 15;
 const RCTL_BSIZE_2048: u32 = 0 << 16;
 const RCTL_SECRC: u32  = 1 << 26;
 
-// Configuration TCTL
 const TCTL_EN: u32     = 1 << 1;
 const TCTL_PSP: u32    = 1 << 3;
 const TCTL_CT_SHIFT: u32 = 4;
@@ -57,7 +58,6 @@ const NB_DESCRIPTEURS_RX: usize = 32;
 const NB_DESCRIPTEURS_TX: usize = 16;
 const TAILLE_TAMPON: usize = 2048;
 
-/// Descripteur RX matériel aligné sur 16 octets
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct DescripteurRx {
@@ -69,7 +69,6 @@ pub struct DescripteurRx {
     pub special: u16,
 }
 
-/// Descripteur TX matériel aligné sur 16 octets
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct DescripteurTx {
@@ -324,7 +323,15 @@ pub fn initialiser() {
         pci::activer_bus_master_et_memoire(periph.bus, periph.slot, periph.fonction);
 
         let base_physique = (periph.bar0 & !0x0F) as u64;
-        let base_virtuelle = memory::physique_vers_virtuelle(base_physique) as usize;
+        
+        // Mappage MMIO explicite de la zone e1000 pour éviter le Page Fault (#PF)
+        let base_virtuelle = match memory::mapper_mmio(base_physique, 128 * 1024) {
+            Some(vaddr) => vaddr as usize,
+            None => {
+                crate::klog!("[NET] ERREUR : Impossible de mapper la zone MMIO e1000.");
+                return;
+            }
+        };
 
         if let Some(carte) = unsafe { CarteE1000::new(base_virtuelle) } {
             crate::klog!("[NET] e1000 operationnel : RX Ring (32) + TX Ring (16) armes");

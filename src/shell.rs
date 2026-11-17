@@ -1,6 +1,10 @@
-// QBX Shell Module - Révision 1.9
-// Fichier : src/shell.rs
-// Description : Interpréteur avec historique, redirection, saisie masquée (*) et intégration modulaire de l'aide
+// =========================================================================
+// Nom du script       : src/shell.rs
+// Numéro de révision  : Révision 2.1
+// Description         : Interpréteur avec historique, redirection, saisie masquée (*) 
+//                       et préservation complète de la casse (minuscules et majuscules) 
+//                       lors de la frappe au clavier.
+// =========================================================================
 
 use crate::{commandes, print, println, vga_buffer, session};
 use spin::Mutex;
@@ -121,6 +125,7 @@ impl Shell {
                 }
                 caractere => {
                     if self.cursor < BUFFER_SIZE - 1 {
+                        // CORRECTION : Conserve exactement la casse saisie (minuscules et majuscules)
                         self.buffer[self.cursor] = caractere as u8;
                         self.cursor += 1;
                         print!("{}", caractere);
@@ -232,11 +237,12 @@ impl Shell {
             return;
         }
 
-        let commande = parties[0];
+        let commande_brute = parties[0];
+        let commande = commande_brute.to_ascii_lowercase(); // Assure la compatibilité insensible à la casse
         let argument = parties.get(1).copied().unwrap_or("");
         let args = &parties[1..];
 
-        match commande {
+        match commande.as_str() {
             "initarch" => {
                 if session::est_archi_initialise() {
                     println!("qbx: Clé Architecte déjà scellée sur ce système.");
@@ -383,8 +389,8 @@ impl Shell {
                 let reste_args = if entree.len() > 3 { entree[3..].trim() } else { "" };
                 commandes::sys::executer(reste_args);
             }
-             "log" => {
-                            commandes::log::executer();
+            "log" => {
+                commandes::log::executer();
             }
             "strt" => {
                 let reste_args = if entree.len() > 4 { entree[4..].trim() } else { "" };

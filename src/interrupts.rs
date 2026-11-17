@@ -1,10 +1,15 @@
-// QBX Interrupts Module - Révision 0.9
-// Fichier : src/interrupts.rs
-// Description : Gestionnaire d'interruption (Exceptions x86, horloge cadencée pour préemption, clavier et Page Fault #PF)
+// =========================================================================
+// Nom du script       : src/interrupts.rs
+// Numéro de révision  : Révision 0.14
+// Description         : Gestionnaire d'interruptions (Exceptions x86, horloge, 
+//                       et fonction de scrutation polling clavier PS/2 pour 
+//                       contourner les limitations APIC/IOAPIC sous UEFI/OVMF).
+// =========================================================================
 
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::registers::control::Cr2;
-use crate::{println, clavier_queue, klog};
+use x86_64::instructions::port::Port;
+use crate::{println, print, clavier_queue, klog};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use pic8259::ChainedPics;
@@ -43,16 +48,42 @@ lazy_static! {
     };
 }
 
-pub fn init_idt() {
+// --- [FONCTION 1] Initialisation globale IDT, PIC et activation du port PS/2 ---
+pub fn init() {
     IDT.load();
+    unsafe {
+        PICS.lock().initialize();
+        PICS.lock().write_masks(0, 0);
+
+        let mut command_port = Port::<u8>::new(0x64);
+        let mut timeout = 100_000;
+        while (command_port.read() & 2) != 0 && timeout > 0 {
+            timeout -= 1;
+        }
+        command_port.write(0xAE); // Activer le port PS/2 1
+    }
 }
 
+// --- [FONCTION 2] Scrutation clavier en mode Polling (contournement IOAPIC UEFI) ---
+pub fn scruter_clavier_ps2() {
+    let mut status_port = Port::<u8>::new(0x64);
+    let mut data_port = Port::<u8>::new(0x60);
+
+    unsafe {
+        // Si le buffer de sortie du contrôleur PS/2 contient un octet prêt
+        if (status_port.read() & 0x01) != 0 {
+            let scancode = data_port.read();
+            clavier_queue::ajouter_scancode(scancode);
+        }
+    }
+}
+
+// --- [FONCTION 3] Gestionnaire d'exception Breakpoint ---
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
-// --- [INTERRUPTION 14 : Page Fault #PF] ---
-// Capture les accès aux adresses mémoire non mappées ou non autorisées
+// --- [FONCTION 4] Gestionnaire d'interruption 14 : Page Fault #PF ---
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
@@ -73,23 +104,16 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 }
 
-// --- [INTERRUPTION 32 : Horloge PIT (Timer)] ---
-// Cadence la préemption des tâches à chaque battement matériel
+// --- [FONCTION 5] Gestionnaire d'interruption 32 : Horloge PIT (Timer) ---
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // 1. Clôture de l'interruption auprès du contrôleur PIC
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
-
-    // 2. Déclenchement de l'arbitrage préemptif (passage automatique de tâche)
     crate::task::cadencer_preemption();
 }
 
-// --- [INTERRUPTION 33 : Clavier PS/2] ---
-// Interception matérielle asynchrone (Pousse le scancode et clôture immédiatement l'IRQ)
+// --- [FONCTION 6] Gestionnaire d'interruption 33 : Clavier PS/2 ---
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use x86_64::instructions::port::Port;
-
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
 

@@ -1,50 +1,107 @@
-// QBX EDT Affichage - Révision 1.0
-// Fichier : src/commandes/edt/affichage.rs
-// Description : Rendu direct en mémoire VGA (0xb8000) avec indicateur L/C et flash de sauvegarde
+// =========================================================================
+// Nom du script       : src/commandes/edt/affichage.rs
+// Numéro de révision  : Révision 2.1
+// Description         : Rendu graphique plein écran de l'éditeur via le Framebuffer 
+//                       adapté au zoom x2 et nettoyage complet à l'ouverture.
+// =========================================================================
 
 use crate::commandes::edt::moteur::Editeur;
+use crate::vga_buffer;
 
-pub const LARGEUR: usize = 80;
-pub const HAUTEUR_EDIT: usize = 23;
-const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
+pub const LARGEUR: usize = 50; // Nombre de colonnes adaptées au zoom x2
+pub const HAUTEUR_EDIT: usize = 20; // Nombre de lignes visibles dans la zone d'édition
 
-// --- [FONCTION 1 : ecrire_vga] ---
-// Description : Écrit directement un octet et sa couleur aux coordonnées (x, y) en mémoire vidéo.
-pub fn ecrire_vga(x: usize, y: usize, octet: u8, couleur: u8) {
-    let offset = (y * LARGEUR + x) * 2;
-    unsafe {
-        *VGA_BUFFER.add(offset) = octet;
-        *VGA_BUFFER.add(offset + 1) = couleur;
-    }
-}
+// --- [FONCTION 1 : vga_attr_to_argb] ---
+// Description : Convertit les attributs de couleur VGA en ARGB 32-bit.
+fn vga_attr_to_argb(attr: u8) -> (u32, u32) {
+    let fg = attr & 0x0F;
+    let bg = (attr >> 4) & 0x0F;
 
-// --- [FONCTION 2 : effacer_ecran_complet] ---
-// Description : Balaye l'intégralité des 25 lignes de l'écran pour le remplir d'espaces.
-pub fn effacer_ecran_complet() {
-    for y in 0..25 {
-        for x in 0..LARGEUR {
-            ecrire_vga(x, y, b' ', 0x07);
+    let to_rgb = |c: u8, bright: bool| -> u32 {
+        match c & 0x07 {
+            0 => if bright { 0x00_55_55_55 } else { 0x00_00_00_00 },
+            1 => if bright { 0x00_55_55_FF } else { 0x00_00_00_AA },
+            2 => if bright { 0x00_00_FF_00 } else { 0x00_00_AA_00 }, // Vert terminal vif
+            3 => if bright { 0x00_55_FF_FF } else { 0x00_00_AA_AA },
+            4 => if bright { 0x00_FF_55_55 } else { 0x00_AA_00_00 },
+            5 => if bright { 0x00_FF_55_FF } else { 0x00_AA_00_AA },
+            6 => if bright { 0x00_FF_FF_55 } else { 0x00_AA_55_00 },
+            7 => if bright { 0x00_FF_FF_FF } else { 0x00_AA_AA_AA },
+            _ => 0x00_FF_FF_FF,
         }
-    }
+    };
+
+    (to_rgb(fg & 0x07, (fg & 0x08) != 0), to_rgb(bg & 0x07, false))
 }
 
-// --- [FONCTION 3 : dessiner_barre_statut] ---
-// Description : Trace la ligne de statut avec position L/C, nom du fichier ou message de sauvegarde.
+// --- [FONCTION 2 : ecrire_vga] ---
+// Description : Dessine un caractère avec le zoom x2 aux coordonnées grille (x, y).
+pub fn ecrire_vga(x: usize, y: usize, octet: u8, couleur: u8) {
+    if x >= LARGEUR || y > HAUTEUR_EDIT + 1 { return; }
+    let (fg, bg) = vga_attr_to_argb(couleur);
+
+    vga_buffer::avec_framebuffer(|addr, width, height, pitch| {
+        // Position avec décalage de marge (20 pixels) et taille zoomée (16x32 par caractère)
+        let px = 20 + (x * 16);
+        let py = 20 + (y * 32);
+        let code = (octet as usize).min(vga_buffer::FONT_8X16.len() - 1);
+        let glyph = &vga_buffer::FONT_8X16[code];
+
+        unsafe {
+            for (row, &byte_row) in glyph.iter().enumerate() {
+                for col in 0..8 {
+                    let bit_on = (byte_row & (1 << (7 - col))) != 0;
+                    
+                    // Application du zoom x2 (blocs de 2x2 pixels)
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let target_x = px + (col * 2) + dx;
+                            let target_y = py + (row * 2) + dy;
+
+                            if target_x < width && target_y < height {
+                                let color = if bit_on { fg } else { bg };
+                                *addr.add(target_y * pitch + target_x) = color;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// --- [FONCTION 3 : effacer_ecran_complet] ---
+// Description : Efface toute la zone de l'éditeur en noir pour éviter les superpositions.
+pub fn effacer_ecran_complet() {
+    vga_buffer::avec_framebuffer(|addr, width, height, pitch| {
+        unsafe {
+            for y in 20..(height - 20) {
+                for x in 20..(width - 20) {
+                    *addr.add(y * pitch + x) = 0x00_00_00_00;
+                }
+            }
+        }
+    });
+}
+
+// --- [FONCTION 4 : dessiner_barre_statut] ---
+// Description : Trace la barre de statut en bas de la zone d'édition.
 pub fn dessiner_barre_statut(nom_fichier: &str, ligne: usize, col: usize, sauvegarde_flash: bool) {
+    let statut_y = HAUTEUR_EDIT + 1;
     for x in 0..LARGEUR {
-        ecrire_vga(x, 24, b'-', 0x07);
+        ecrire_vga(x, statut_y, b'-', 0x07);
     }
 
     let mut pos = 0;
     let entete = if sauvegarde_flash {
-        alloc::string::String::from(" [ Sauvegarde avec succes ! ] ")
+        alloc::string::String::from(" [ Succes ! ] ")
     } else {
-        alloc::format!(" L:{} C:{} | Fichier: ", ligne + 1, col + 1)
+        alloc::format!(" L:{} C:{} | ", ligne + 1, col + 1)
     };
 
     for b in entete.bytes() {
         if pos < LARGEUR {
-            ecrire_vga(pos, 24, b, if sauvegarde_flash { 0x0a } else { 0x0f });
+            ecrire_vga(pos, statut_y, b, if sauvegarde_flash { 0x0a } else { 0x0f });
             pos += 1;
         }
     }
@@ -52,27 +109,27 @@ pub fn dessiner_barre_statut(nom_fichier: &str, ligne: usize, col: usize, sauveg
     if !sauvegarde_flash {
         for b in nom_fichier.bytes() {
             if pos < LARGEUR {
-                ecrire_vga(pos, 24, b, 0x0e);
+                ecrire_vga(pos, statut_y, b, 0x0e);
                 pos += 1;
             }
         }
-        let suite = " | [F2] Enregistrer | [ESC] Quitter";
+        let suite = " | [F2]:Sauv [ESC]:Quit";
         for b in suite.bytes() {
             if pos < LARGEUR {
-                ecrire_vga(pos, 24, b, 0x0f);
+                ecrire_vga(pos, statut_y, b, 0x0f);
                 pos += 1;
             }
         }
     }
 
     while pos < LARGEUR {
-        ecrire_vga(pos, 24, b' ', 0x0f);
+        ecrire_vga(pos, statut_y, b' ', 0x0f);
         pos += 1;
     }
 }
 
-// --- [FONCTION 4 : dessiner_interface] ---
-// Description : Efface l'écran, calcule la position du curseur (L/C) et restitue le texte visible.
+// --- [FONCTION 5 : dessiner_interface] ---
+// Description : Rafraîchit l'affichage complet de l'éditeur.
 pub fn dessiner_interface(editeur: &Editeur) {
     effacer_ecran_complet();
 
@@ -82,7 +139,6 @@ pub fn dessiner_interface(editeur: &Editeur) {
         "[Sans nom]"
     };
 
-    // Calculer la ligne et la colonne actuelles en fonction de la position du curseur
     let mut ligne = 0;
     let mut col = 0;
     for i in 0..editeur.curseur_pos.min(editeur.tampon.len()) {
@@ -96,7 +152,6 @@ pub fn dessiner_interface(editeur: &Editeur) {
     
     dessiner_barre_statut(nom, ligne, col, editeur.sauvegarde_flash);
 
-    // 1. Trouver l'index du tampon où commence la première ligne visible (ligne_debut)
     let mut byte_debut_affichage = 0;
     let mut lignes_compteur = 0;
     
@@ -117,15 +172,8 @@ pub fn dessiner_interface(editeur: &Editeur) {
     let mut screen_y = 0;
     let mut abs_line_num = editeur.ligne_debut;
 
-    // Affichage du premier numéro de ligne si l'option -l est active
     if editeur.option_l && screen_y < HAUTEUR_EDIT {
-        let num_str = if abs_line_num + 1 < 10 {
-            alloc::format!("{}  ", abs_line_num + 1)
-        } else if abs_line_num + 1 < 100 {
-            alloc::format!("{} ", abs_line_num + 1)
-        } else {
-            alloc::format!("{}", abs_line_num + 1)
-        };
+        let num_str = alloc::format!("{:2} ", abs_line_num + 1);
         for &b in num_str.as_bytes() {
             ecrire_vga(screen_x, screen_y, b, 0x08);
             screen_x += 1;
@@ -139,7 +187,6 @@ pub fn dessiner_interface(editeur: &Editeur) {
     };
     let en_selection = editeur.selection_debut.is_some();
 
-    // 2. Parcourir le tampon à partir du début de la zone visible
     for (i, &byte) in editeur.tampon.iter().enumerate().skip(byte_debut_affichage) {
         let est_curseur = i == editeur.curseur_pos;
         let dans_bloc = en_selection && i >= sel_min && i < sel_max;
@@ -165,24 +212,21 @@ pub fn dessiner_interface(editeur: &Editeur) {
             }
 
             if editeur.option_l {
-                let num_str = if abs_line_num + 1 < 10 {
-                    alloc::format!("{}  ", abs_line_num + 1)
-                } else if abs_line_num + 1 < 100 {
-                    alloc::format!("{} ", abs_line_num + 1)
-                } else {
-                    alloc::format!("{}", abs_line_num + 1)
-                };
+                let num_str = alloc::format!("{:2} ", abs_line_num + 1);
                 for &b in num_str.as_bytes() {
                     ecrire_vga(screen_x, screen_y, b, 0x08);
                     screen_x += 1;
                 }
             }
         } else {
-            ecrire_vga(screen_x, screen_y, byte, couleur);
-            screen_x += 1;
-            if screen_x >= LARGEUR {
-                screen_x = 0;
-                screen_y += 1;
+            // Filtrer les retours chariot parasites
+            if byte != b'\r' {
+                ecrire_vga(screen_x, screen_y, byte, couleur);
+                screen_x += 1;
+                if screen_x >= LARGEUR {
+                    screen_x = 0;
+                    screen_y += 1;
+                }
             }
         }
 
@@ -191,7 +235,6 @@ pub fn dessiner_interface(editeur: &Editeur) {
         }
     }
 
-    // Si le curseur est placé à la toute fin du fichier
     if editeur.curseur_pos >= editeur.tampon.len() && screen_y < HAUTEUR_EDIT {
         ecrire_vga(screen_x, screen_y, b'_', 0x0f);
     }
